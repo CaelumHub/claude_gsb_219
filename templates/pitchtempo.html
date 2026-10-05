@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+{% block title %}变调与变速{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>变调与变速</h1>
+    <div class="sub">音高与速度独立调节 — 变速不变调 · 变调不变速 · 或两者同时（WSOLA 时域伸缩 + 加窗 sinc 重采样）</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+  </div>
+</div>
+
+<div class="card">
+  <h2>变调（音高，不影响时长）</h2>
+  <div class="row">
+    <label class="field" style="flex:1">
+      <span>音高偏移 <b class="mono" id="semiVal">0.0</b> 半音</span>
+      <input type="range" id="semi" min="-12" max="12" step="0.1" value="0" />
+    </label>
+    <label class="field inline">半音
+      <input type="number" id="semiNum" min="-12" max="12" step="0.1" value="0" style="width:90px"/>
+    </label>
+  </div>
+  <div class="row">
+    <button class="btn-sm" data-semi="-12">-12</button>
+    <button class="btn-sm" data-semi="-7">-7</button>
+    <button class="btn-sm" data-semi="-5">-5</button>
+    <button class="btn-sm" data-semi="-2">-2</button>
+    <button class="btn-sm" data-semi="0">复位</button>
+    <button class="btn-sm" data-semi="2">+2</button>
+    <button class="btn-sm" data-semi="5">+5</button>
+    <button class="btn-sm" data-semi="7">+7</button>
+    <button class="btn-sm" data-semi="12">+12</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>变速（速度，不影响音高）</h2>
+  <div class="row">
+    <label class="field" style="flex:1">
+      <span>速度 <b class="mono" id="tempoVal">1.00</b>×（&lt;1 变慢变长，&gt;1 变快变短）</span>
+      <input type="range" id="tempo" min="0.5" max="2" step="0.01" value="1" />
+    </label>
+    <label class="field inline">倍率
+      <input type="number" id="tempoNum" min="0.5" max="2" step="0.01" value="1" style="width:90px"/>
+    </label>
+  </div>
+  <div class="row">
+    <button class="btn-sm" data-tempo="0.5">0.5×</button>
+    <button class="btn-sm" data-tempo="0.75">0.75×</button>
+    <button class="btn-sm" data-tempo="0.9">0.9×</button>
+    <button class="btn-sm" data-tempo="1">复位</button>
+    <button class="btn-sm" data-tempo="1.1">1.1×</button>
+    <button class="btn-sm" data-tempo="1.25">1.25×</button>
+    <button class="btn-sm" data-tempo="1.5">1.5×</button>
+    <button class="btn-sm" data-tempo="2">2×</button>
+  </div>
+  <div class="row mt">
+    <span class="muted small" id="estimate">选择文件后显示预计输出时长。</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">预览与导出</h2>
+    <div class="row">
+      <label class="field inline">起点(s)
+        <input type="number" id="startSec" value="0" min="0" step="0.5" style="width:80px"/>
+      </label>
+      <label class="field inline">时长(s)
+        <select id="prevDur">
+          <option value="4">4</option>
+          <option value="8" selected>8</option>
+          <option value="15">15</option>
+        </select>
+      </label>
+      <button class="btn-primary" id="previewBtn">▶ 预览</button>
+      <button class="btn-green" id="applyBtn">应用到整个文件</button>
+    </div>
+  </div>
+  <div class="row">
+    <button id="playPreview" class="hidden">▶ 播放预览</button>
+    <span id="previewInfo" class="muted small"></span>
+  </div>
+  <div id="result" class="mt"></div>
+  <details class="help">
+    <summary>原理说明</summary>
+    变速采用 WSOLA（波形相似重叠相加）：在输出时间轴上等距放置帧，在输入侧 ±12 ms 容差内
+    搜索与上一帧自然延续互相关最强的位置拼接，时域算法因此能保留鼓点与拨弦的瞬态，
+    没有相位声码器的"金属感"；变调先将信号按 2^(半音/12) 做加窗 sinc 重采样（改变音高与时长），
+    再用同一 WSOLA 引擎把时长精确补偿回原值。两个旋钮完全解耦：只变速时音高不变，
+    只变调时时长不变。立体声的偏移路径由单声道引导信号统一计算，各声道共用，声像不漂移；
+    输出仅在可能削波时做整体限幅，杜绝爆音。
+  </details>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let files = [], previewWav = null;
+
+async function loadFiles(selected) {
+  files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+  updateEstimate();
+}
+
+function semitones() { return +$("#semi").value; }
+function tempo() { return +$("#tempo").value; }
+
+function syncSemi(v) {
+  v = Math.max(-12, Math.min(12, +v || 0));
+  $("#semi").value = v; $("#semiNum").value = v;
+  $("#semiVal").textContent = (+v).toFixed(1);
+  updateEstimate();
+}
+function syncTempo(v) {
+  v = Math.max(0.5, Math.min(2, +v || 1));
+  $("#tempo").value = v; $("#tempoNum").value = v;
+  $("#tempoVal").textContent = (+v).toFixed(2);
+  updateEstimate();
+}
+
+function updateEstimate() {
+  const f = files.find(x => x.id === $("#fileSel").value);
+  if (!f) return;
+  const out = f.duration / tempo();
+  const parts = [];
+  if (semitones() !== 0) parts.push(`升/降 ${semitones()} 半音`);
+  if (tempo() !== 1) parts.push(`速度 ${tempo()}×`);
+  $("#estimate").textContent =
+    `原时长 ${fmtTime(f.duration)} → 预计输出 ${fmtTime(out)}` +
+    (parts.length ? `（${parts.join("，")}）` : "（未做任何改变）");
+}
+
+$("#semi").addEventListener("input", e => syncSemi(e.target.value));
+$("#semiNum").addEventListener("input", e => syncSemi(e.target.value));
+$("#tempo").addEventListener("input", e => syncTempo(e.target.value));
+$("#tempoNum").addEventListener("input", e => syncTempo(e.target.value));
+$("#fileSel").addEventListener("change", updateEstimate);
+document.addEventListener("click", e => {
+  if (e.target.dataset.semi != null) syncSemi(+e.target.dataset.semi);
+  if (e.target.dataset.tempo != null) syncTempo(+e.target.dataset.tempo);
+});
+
+$("#previewBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  const btn = $("#previewBtn"); btn.disabled = true;
+  $("#previewInfo").textContent = "渲染中…";
+  try {
+    const r = await API.post("/api/pitchtempo/preview", {
+      file_id: id, semitones: semitones(), tempo: tempo(),
+      start: +$("#startSec").value || 0, duration: +$("#prevDur").value || 8,
+    });
+    previewWav = r.wav;
+    $("#playPreview").classList.remove("hidden");
+    $("#previewInfo").textContent = `预览已渲染（${fmtBytes(r.size)}）`;
+    playBase64Wav(previewWav);
+  } catch (e) { $("#previewInfo").textContent = ""; toast(e.message, "error"); }
+  finally { btn.disabled = false; }
+};
+$("#playPreview").onclick = () => { if (previewWav) playBase64Wav(previewWav); };
+
+$("#applyBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  if (semitones() === 0 && tempo() === 1) return toast("音高与速度都未改变", "warn");
+  const btn = $("#applyBtn"); btn.disabled = true; btn.textContent = "处理中…";
+  try {
+    const entry = await API.post("/api/pitchtempo/apply", {
+      file_id: id, semitones: semitones(), tempo: tempo(),
+    });
+    toast("已生成新文件: " + entry.name, "success");
+    $("#result").innerHTML = `
+      <div class="file-card row between">
+        <div>
+          <div class="name">${esc(entry.name)}</div>
+          <div class="meta">${fmtTime(entry.duration)} · ${entry.sr} Hz · ${entry.channels} 声道</div>
+        </div>
+        <div class="row">
+          <button class="btn-sm" onclick="playFile('${entry.id}','${esc(entry.name)}')">▶ 播放</button>
+          <a class="btn btn-sm" href="${API.downloadUrl(entry.id)}">下载</a>
+        </div>
+      </div>`;
+    await loadFiles(entry.id);
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "应用到整个文件"; }
+};
+
+loadFiles(new URLSearchParams(location.search).get("file"));
+</script>
+{% endblock %}

@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, chords, effects, mixer, pitchtime, realtime, separation, storage
 
 try:
     from flask_cors import CORS
@@ -91,6 +91,7 @@ PAGES = {
     "chords": "和弦识别",
     "separation": "音源分离",
     "effects": "效果链",
+    "pitchtempo": "变调与变速",
     "mixer": "混音台",
     "export": "导出与转换",
     "history": "项目历史",
@@ -524,6 +525,66 @@ def api_effects_apply():
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
     effects.apply_chain_to_file(_abs_path(entry), dst, chain)
     new_entry = _register_derived(entry["id"], name, dst, {"effects": chain})
+    return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Pitch shift & time stretch (变调与变速)
+# --------------------------------------------------------------------------- #
+
+def _pitchtempo_params(data: Dict) -> tuple:
+    """Validate/clamp the two independent controls."""
+    try:
+        semitones = float(data.get("semitones", 0.0) or 0.0)
+        tempo = float(data.get("tempo", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        raise ValueError("semitones and tempo must be numbers")
+    semitones = min(24.0, max(-24.0, semitones))
+    tempo = min(4.0, max(0.25, tempo))
+    return semitones, tempo
+
+
+@app.post("/api/pitchtempo/preview")
+def api_pitchtempo_preview():
+    data = request.get_json(force=True) or {}
+    file_id = data.get("file_id")
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    semitones, tempo = 0.0, 1.0
+    try:
+        semitones, tempo = _pitchtempo_params(data)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    start = float(data.get("start", 0) or 0)
+    duration = min(15.0, max(1.0, float(data.get("duration", 8) or 8)))
+    wav = pitchtime.render_preview(_abs_path(entry), semitones, tempo, start, duration)
+    return jsonify({"wav": base64.b64encode(wav).decode(), "size": len(wav)})
+
+
+@app.post("/api/pitchtempo/apply")
+def api_pitchtempo_apply():
+    data = request.get_json(force=True) or {}
+    file_id = data.get("file_id")
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    try:
+        semitones, tempo = _pitchtempo_params(data)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    name = data.get("name") or f"{semitones:+g}st-{tempo:g}x-{entry['name']}"
+
+    file_id_new = storage.new_id()
+    dst = os.path.join(store.audio_dir, file_id_new + ".wav")
+    try:
+        pitchtime.process_file(_abs_path(entry), dst, semitones, tempo)
+    except MemoryError as e:
+        if os.path.exists(dst):
+            os.unlink(dst)
+        return jsonify(error=str(e)), 413
+    new_entry = _register_derived(entry["id"], name, dst,
+                                  {"pitchtempo": {"semitones": semitones, "tempo": tempo}})
     return jsonify(new_entry)
 
 
