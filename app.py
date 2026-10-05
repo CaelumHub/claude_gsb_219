@@ -6,7 +6,7 @@ Run with:
 
     python3 app.py            # starts on http://127.0.0.1:8000
 
-Pages (10) are rendered from the ``templates/`` directory; the API lives under
+Pages (11) are rendered from the ``templates/`` directory; the API lives under
 ``/api/`` and the raw audio files under ``/api/audio/<id>``.
 """
 
@@ -22,7 +22,10 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import (
+    analysis, audio_io, chords, effects, mixer, realtime,
+    separation, storage, transform,
+)
 
 try:
     from flask_cors import CORS
@@ -90,6 +93,7 @@ PAGES = {
     "pitch_beat": "音高与节拍",
     "chords": "和弦识别",
     "separation": "音源分离",
+    "transform": "变调与变速",
     "effects": "效果链",
     "mixer": "混音台",
     "export": "导出与转换",
@@ -524,6 +528,89 @@ def api_effects_apply():
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
     effects.apply_chain_to_file(_abs_path(entry), dst, chain)
     new_entry = _register_derived(entry["id"], name, dst, {"effects": chain})
+    return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Pitch shifting & time scaling
+# --------------------------------------------------------------------------- #
+
+def _parse_transform_params(data: Dict):
+    """Validate / normalise pitch-speed request parameters."""
+    speed = float(data.get("speed", 1.0))
+    semitones = float(data.get("semitones", 0.0))
+    quality = str(data.get("quality", "balanced"))
+    if not (transform.MIN_SPEED <= speed <= transform.MAX_SPEED):
+        raise ValueError(f"speed must be within [{transform.MIN_SPEED}, {transform.MAX_SPEED}]")
+    if not (transform.MIN_SEMITONES <= semitones <= transform.MAX_SEMITONES):
+        raise ValueError(
+            f"semitones must be within [{transform.MIN_SEMITONES}, {transform.MAX_SEMITONES}]")
+    if quality not in transform.QUALITIES:
+        quality = "balanced"
+    return speed, semitones, quality
+
+
+def _transform_label(speed: float, semitones: float) -> str:
+    parts = []
+    if abs(speed - 1.0) >= 1e-6:
+        parts.append(f"{speed:g}x")
+    if abs(semitones) >= 1e-6:
+        parts.append(("+" if semitones > 0 else "") + f"{semitones:g}st")
+    return "_".join(parts) if parts else "原样"
+
+
+@app.post("/api/transform/preview")
+def api_transform_preview():
+    data = request.get_json(force=True) or {}
+    file_id = data.get("file_id")
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    try:
+        speed, semitones, _quality = _parse_transform_params(data)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    start = max(0.0, float(data.get("start", 0.0)))
+    duration = max(0.5, min(10.0, float(data.get("duration", 5.0))))
+    # Previews are short: the fastest preset keeps the UI responsive.
+    wav = transform.render_preview(
+        _abs_path(entry), speed=speed, semitones=semitones,
+        quality="draft", start_s=start, duration_s=duration)
+    return jsonify({
+        "wav": base64.b64encode(wav).decode(),
+        "size": len(wav),
+        "speed": speed,
+        "semitones": semitones,
+        "pitch_ratio": transform.semitones_to_ratio(semitones),
+        "duration_factor": 1.0 / speed,
+    })
+
+
+@app.post("/api/transform/apply")
+def api_transform_apply():
+    data = request.get_json(force=True) or {}
+    file_id = data.get("file_id")
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    try:
+        speed, semitones, quality = _parse_transform_params(data)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    file_id_new = storage.new_id()
+    dst = os.path.join(store.audio_dir, file_id_new + ".wav")
+    info = transform.transform_file(
+        _abs_path(entry), dst, speed=speed, semitones=semitones, quality=quality)
+    label = _transform_label(speed, semitones)
+    name = data.get("name") or f"变调变速[{label}]-{entry['name']}"
+    new_entry = _register_derived(entry["id"], name, dst, {
+        "op": "transform",
+        "speed": speed,
+        "semitones": semitones,
+        "pitch_ratio": info["pitch_ratio"],
+        "quality": quality,
+    })
     return jsonify(new_entry)
 
 

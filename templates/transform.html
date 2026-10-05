@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{% block title %}变调与变速{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>变调与变速</h1>
+    <div class="sub">音高与速度独立调节：只变速不变调 · 只变调不变速 · 两者同时 · 连续可调（相位声码器 + 带限重采样）</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">参数</h2>
+    <div class="row">
+      <select id="presetSel" style="min-width:170px"><option value="">快捷预设…</option></select>
+      <button class="btn-sm" id="resetBtn">重置</button>
+    </div>
+  </div>
+
+  <div class="grid cols-2">
+    <div>
+      <label class="field">
+        <span>速度（倍速，1 = 原速） <b class="faint mono"><span id="speedVal">1.00</span>× · <span id="durVal"></span></b></span>
+        <input type="range" id="speed" min="0.25" max="4" step="0.01" value="1" />
+      </label>
+      <div class="row small muted mt">
+        <span>0.25× 慢</span><span class="spacer"></span><span>1×</span><span class="spacer"></span><span>4× 快</span>
+      </div>
+    </div>
+    <div>
+      <label class="field">
+        <span>变调（半音） <b class="faint mono"><span id="pitchVal">+0.0</span> 半音 · 音高 ×<span id="ratioVal">1.000</span></b></span>
+        <input type="range" id="pitch" min="-12" max="12" step="0.1" value="0" />
+      </label>
+      <div class="row small muted mt">
+        <span>-12 降八度</span><span class="spacer"></span><span>0</span><span class="spacer"></span><span>+12 升八度</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row mt">
+    <label class="field inline">预览时长(s)
+      <input type="number" id="previewDur" value="5" min="1" max="10" step="0.5" style="width:70px"/>
+    </label>
+    <label class="field inline">整段处理质量
+      <select id="quality">
+        <option value="draft">快速（短窗）</option>
+        <option value="balanced" selected>均衡（推荐）</option>
+        <option value="high">高质量（长窗，人声/音乐）</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="row mt">
+    <button class="btn-primary" id="previewBtn">▶ 生成预览</button>
+    <button class="btn-green" id="applyBtn">应用到整个文件</button>
+    <span id="status" class="muted small"></span>
+  </div>
+
+  <div class="row mt" id="previewRow">
+    <button id="playPreview" class="hidden">▶ 播放预览</button>
+    <span id="previewInfo" class="muted small"></span>
+  </div>
+
+  <details class="help">
+    <summary>原理说明</summary>
+    时间维度由<b>相位声码器</b>完成：对信号做 75% 重叠加窗 STFT，解卷绕每帧相位差并做
+    <b>峰值相位锁定（Laroche–Dolson）</b>，再按新的合成跳步叠加，改变时长而不改变频谱，因此音高不变。
+    变调则在此基础上级联一个 <b>Kaiser 加窗 sinc 带限重采样器</b>，按比例改放音速率从而整体移动音高，
+    同时把时长补回，做到变调不变速。两者级联即可任意独立组合：最终时长 = 原时长 ÷ 速度，
+    最终音高 = 原音高 × 2<sup>(半音/12)</sup>。参数支持连续值，升/降调、加/减速全覆盖。
+  </details>
+</div>
+
+<div class="card">
+  <h2>结果</h2>
+  <table>
+    <thead><tr><th>名称</th><th>速度</th><th>变调</th><th>时长</th><th>采样率</th><th>大小</th><th>操作</th></tr></thead>
+    <tbody id="results">
+      <tr><td colspan="7" class="muted">还没有生成结果。</td></tr>
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let previewWav = null, currentFile = null;
+
+const PRESETS = [
+  { name: "只加速 1.5×（音高不变）", speed: 1.5, pitch: 0 },
+  { name: "只减速 0.75×（音高不变）", speed: 0.75, pitch: 0 },
+  { name: "升调 +2 半音（时长不变）", speed: 1, pitch: 2 },
+  { name: "升调 +7 纯五度（时长不变）", speed: 1, pitch: 7 },
+  { name: "降调 −3 半音（时长不变）", speed: 1, pitch: -3 },
+  { name: "降八度 −12 半音（时长不变）", speed: 1, pitch: -12 },
+  { name: "加速 1.25× 且升调 +1", speed: 1.25, pitch: 1 },
+  { name: "减速 0.8× 且降调 −2", speed: 0.8, pitch: -2 },
+];
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+  currentFile = files.find(f => f.id === sel.value);
+  updateSummary();
+}
+
+function speed() { return +$("#speed").value; }
+function pitch() { return +$("#pitch").value; }
+
+function fmtSigned(v, digits) {
+  return (v > 0 ? "+" : "") + v.toFixed(digits);
+}
+
+function updateSummary() {
+  const sp = speed(), st = pitch();
+  $("#speedVal").textContent = sp.toFixed(2);
+  $("#pitchVal").textContent = fmtSigned(st, 1);
+  $("#ratioVal").textContent = Math.pow(2, st / 12).toFixed(3);
+  if (currentFile && currentFile.duration != null) {
+    const d = currentFile.duration / sp;
+    $("#durVal").textContent = `时长 ${fmtTime(d)} / 原 ${fmtTime(currentFile.duration)}`;
+  } else {
+    $("#durVal").textContent = "";
+  }
+}
+
+async function loadResults() {
+  const files = await API.get("/api/library");
+  const items = files.filter(f => f.op === "transform").slice(-15).reverse();
+  $("#results").innerHTML = items.map(f => `
+    <tr>
+      <td class="name">${esc(f.name)}</td>
+      <td class="mono">${(f.speed ?? 1).toFixed(2)}×</td>
+      <td class="mono">${fmtSigned(f.semitones ?? 0, 1)} st</td>
+      <td class="mono">${fmtTime(f.duration)}</td>
+      <td class="mono">${f.sr} Hz</td>
+      <td>${fmtBytes(f.size_bytes)}</td>
+      <td>
+        <button class="btn-sm" onclick="playFile('${f.id}','${esc(f.name)}')">▶ 播放</button>
+        <a class="btn btn-sm" href="${API.downloadUrl(f.id)}">下载</a>
+      </td>
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">还没有生成结果。</td></tr>`;
+}
+
+$("#speed").addEventListener("input", updateSummary);
+$("#pitch").addEventListener("input", updateSummary);
+$("#fileSel").addEventListener("change", async () => {
+  const files = await API.get("/api/library");
+  currentFile = files.find(f => f.id === $("#fileSel").value);
+  updateSummary();
+});
+
+$("#presetSel").innerHTML = `<option value="">快捷预设…</option>` +
+  PRESETS.map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join("");
+$("#presetSel").addEventListener("change", () => {
+  const i = +$("#presetSel").value;
+  if (Number.isNaN(i) || !PRESETS[i]) return;
+  $("#speed").value = PRESETS[i].speed;
+  $("#pitch").value = PRESETS[i].pitch;
+  updateSummary();
+});
+$("#resetBtn").onclick = () => {
+  $("#speed").value = 1; $("#pitch").value = 0; updateSummary();
+};
+
+$("#previewBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  const btn = $("#previewBtn"); btn.disabled = true;
+  $("#status").textContent = "预览渲染中…（约数秒）";
+  try {
+    const r = await API.post("/api/transform/preview", {
+      file_id: id, speed: speed(), semitones: pitch(),
+      start: 0, duration: +$("#previewDur").value,
+    });
+    previewWav = r.wav;
+    $("#playPreview").classList.remove("hidden");
+    $("#previewInfo").textContent =
+      `速度 ${r.speed.toFixed(2)}× · 变调 ${fmtSigned(r.semitones, 1)} 半音 · ` +
+      `音高 ×${r.pitch_ratio.toFixed(3)} · 预览时长系数 ${r.duration_factor.toFixed(2)}（${fmtBytes(r.size)}）`;
+    $("#status").textContent = "";
+    playBase64Wav(previewWav);
+  } catch (e) {
+    $("#status").textContent = "";
+    toast(e.message, "error");
+  } finally { btn.disabled = false; }
+};
+$("#playPreview").onclick = () => { if (previewWav) playBase64Wav(previewWav); };
+
+$("#applyBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  const btn = $("#applyBtn"); btn.disabled = true;
+  btn.textContent = "处理中…";
+  $("#status").textContent = "正在处理整个文件，请稍候";
+  try {
+    const entry = await API.post("/api/transform/apply", {
+      file_id: id, speed: speed(), semitones: pitch(),
+      quality: $("#quality").value,
+    });
+    $("#status").textContent = "完成";
+    toast("已生成: " + entry.name, "success");
+    await loadResults();
+  } catch (e) {
+    $("#status").textContent = "";
+    toast(e.message, "error");
+  } finally { btn.disabled = false; btn.textContent = "应用到整个文件"; }
+};
+
+(async () => {
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+  await loadResults();
+})();
+</script>
+{% endblock %}
